@@ -10,6 +10,7 @@ Group=callme
 WorkingDirectory=/opt/callme
 Environment=HOST=127.0.0.1
 Environment=PORT=3001
+Environment=CALLME_SEED=false
 Environment=DB_PATH=/var/lib/callme/app.sqlite
 Environment=YANDEX_VAULT_DIR=/var/lib/callme/yandex-vault
 EnvironmentFile=/etc/callme/callme.env

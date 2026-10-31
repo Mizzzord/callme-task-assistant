@@ -55,7 +55,7 @@ export function importSeed(ws: Workspace, seed: CalendarEvent[]) {
 export class Store {
   db: DatabaseSync;
   seed: CalendarEvent[];
-  constructor(path = "data/app.sqlite", seed = loadSeed()) {
+  constructor(path = "data/app.sqlite", seed = process.env.CALLME_SEED === "false" ? [] : loadSeed()) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.seed = seed;
