@@ -1,4 +1,4 @@
-import type { AppState, Command } from "@/types";
+import type { AppState, Command } from "../types.ts";
 export type RequestBody = {
   requestId: string;
   workspaceId?: string;
@@ -7,6 +7,7 @@ export type RequestBody = {
   command?: Command;
   source?: "text" | "voice";
   uncertain?: boolean;
+  pendingToken?: string;
 };
 export const headers = {
   "Content-Type": "application/json",

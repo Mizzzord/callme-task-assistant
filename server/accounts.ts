@@ -33,8 +33,12 @@ export type Locked = <T>(id: string, work: () => Promise<T> | T) => Promise<T>;
 const digest = (value: string) =>
   createHash("sha256").update(value).digest("hex");
 const tokenSchema = z.string().regex(/^[a-f0-9]{64}$/);
+const loginName = z.string().trim().normalize().toLowerCase().max(254).refine(
+  (value) => /^[\p{L}\p{N}_.-]{3,40}$/u.test(value) || z.email().safeParse(value).success,
+  "Укажите имя пользователя от 3 до 40 символов или адрес существующего аккаунта.",
+);
 const credentials = z.object({
-  email: z.email().trim().toLowerCase().max(254),
+  email: loginName,
   password: z.string().min(10).max(128),
 });
 const cookieOptions = () => ({
@@ -344,7 +348,7 @@ export function installAccountRoutes(
           store.db.prepare("SELECT 1 FROM users WHERE email=?").get(body.email)
         )
           throw new AccessError(
-            "Не удалось зарегистрировать этот адрес. Попробуйте войти.",
+            "Это имя пользователя уже занято. Попробуйте другое или войдите.",
             409,
           );
         store.db
@@ -377,7 +381,7 @@ export function installAccountRoutes(
       row ? String(row.password_hash) : dummy,
     );
     if (!row || !valid)
-      throw new AccessError("Неверный адрес или пароль.", 401);
+      throw new AccessError("Неверное имя пользователя или пароль.", 401);
     store.transaction(() => {
       let teamId = store.db
         .prepare(

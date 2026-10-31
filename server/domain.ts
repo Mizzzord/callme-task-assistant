@@ -24,6 +24,7 @@ export const commandSchema = z
       "select",
       "confirm",
       "cancel",
+      "reply",
       "unknown",
     ]),
     priority: z.enum(["low", "normal", "high", "urgent"]).optional(),
@@ -42,7 +43,7 @@ export const commandSchema = z
           .object({
             label: z.string().trim().min(1).max(100),
             url: z.string().max(2048),
-            service: z.enum(["telegram", "yandex_notes", "other"]),
+            service: z.enum(["telegram", "yandex_notes", "yandex_mail", "other"]),
           })
           .strict()
           .refine((v) => !linkError(v.url, v.service)),
@@ -70,6 +71,7 @@ export const commandSchema = z
     revision: z.number().int().optional(),
     token: z.string().optional(),
     question: z.string().max(500).optional(),
+    answer: z.string().trim().min(1).max(2000).optional(),
   })
   .strict();
 export const today = (now = new Date()) =>
@@ -186,7 +188,7 @@ export function localCommand(text: string, ws: Workspace, now: Date): Command {
   if (/^(отмена|отмени|нет|не надо)[.!]?$/i.test(t))
     return { action: "cancel" };
   if (
-    /^(да|подтверждаю|подтвердить|сохрани|сохранить|да, удалить)[.!]?$/i.test(t)
+    /^(да|да[, ]+верно|да[, ]+подтверждаю|верно|все верно|правильно|подтверждаю|подтвердить|сохрани|сохранить|да[, ]+удалить)[.!]?$/i.test(t)
   )
     return { action: "confirm" };
   const number = t.match(/^(?:номер |выбери |выбрать )?(\d+)[.!]?$/);
@@ -231,6 +233,12 @@ export function localCommand(text: string, ws: Workspace, now: Date): Command {
       .replace(/(?:\s+на|\s+в)$/, "")
       .trim();
     return { action: "create", kind, ...(title ? { title } : {}), ...fields };
+  }
+  const boardMove = t.match(/^(?:перенеси|перенести|передвинь|перемести)\s+(.+?)\s+(?:в\s+(?:колонку\s+)?)?(работу|в работе|готово|выполнено|к выполнению|выполнению)[.!]?$/);
+  if (boardMove) {
+    const query = boardMove[1].replace(/^(?:задачу|запись)\s+/, "").replace(/^(?:ее|его|эту задачу|эту запись|задачу|запись)$/, "").trim();
+    const status = /работ/.test(boardMove[2]) ? "in_progress" : /готово|выполнено/.test(boardMove[2]) ? "done" : "todo";
+    return { action: "move", status, ...(query ? { query } : {}) };
   }
   if (/^(перенеси|перенести|измени|изменить|переименуй)/.test(t))
     return {
@@ -428,6 +436,8 @@ export function execute(
       now,
     );
   }
+  if (cmd.action === "reply")
+    return { text: cmd.answer || "Уточните, пожалуйста, ваш вопрос." };
   if (cmd.action === "unknown")
     return { text: cmd.question || "Уточните запрос. Изменения не выполнены." };
   if (

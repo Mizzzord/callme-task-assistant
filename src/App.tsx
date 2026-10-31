@@ -14,8 +14,8 @@ import {
   CircleHelp,
   Mic,
   Square,
-  VolumeX,
   CircleAlert,
+  ChevronDown,
   Sparkles,
   Clock3,
   Check,
@@ -24,6 +24,7 @@ import {
   Folder,
   Settings2,
   Link2,
+  Mail,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -53,13 +54,6 @@ import {
   AlertDialogCancel,
   AlertDialogAction,
 } from "@/components/ui/alert-dialog";
-import {
-  Sheet,
-  SheetContent,
-  SheetHeader,
-  SheetTitle,
-  SheetDescription,
-} from "@/components/ui/sheet";
 import {
   Sidebar,
   SidebarProvider,
@@ -115,6 +109,7 @@ import {
   ItemGroup,
 } from "@/components/ui/item";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Select,
   SelectContent,
@@ -134,7 +129,10 @@ import { InviteDialog } from "@/components/invite-dialog";
 import { getState, send, request, headers } from "@/lib/api";
 import type { RequestBody } from "@/lib/api";
 import { VoiceSession } from "@/lib/voice";
+import { VoiceRecording } from "@/lib/voice-recording";
+import { serviceCommand } from "@/lib/service-command";
 import type { VoiceStatus } from "@/lib/voice";
+import type { MicrophoneSensitivity } from "@/lib/speech-segmenter";
 import type { AppState, CalendarEvent, Command } from "@/types";
 const examples = [
   {
@@ -199,7 +197,14 @@ function WorkspaceApp() {
   const currentState = useRef<AppState | undefined>(undefined);
   const [settings, setSettings] = useState(false);
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("off");
+  const [microphoneSensitivity, setMicrophoneSensitivity] = useState<MicrophoneSensitivity>(() => {
+    try { const value = localStorage.getItem("callme-microphone-sensitivity"); return value === "quiet" || value === "noisy" ? value : "normal"; } catch { return "normal"; }
+  });
   const [voiceError, setVoiceError] = useState("");
+  const [serviceResult, setServiceResult] = useState<{ title: string; lines: string[]; mail?: { subject: string; from: string; date?: string; unseen: boolean; url: string }[]; disk?: { path: string; offset: number; total: number; items: { name?: string; type?: string; path?: string; url?: string }[] } }>();
+  const [mailPreview, setMailPreview] = useState<{ eventId: string; revision: number; title: string; subject: string; text: string }>();
+  const [recordingStatus, setRecordingStatus] = useState<"off" | "starting" | "recording" | "processing">("off");
+  const recording = useRef<VoiceRecording | undefined>(undefined);
   const [fileDraft, setFileDraft] = useState<File | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const cameraRef = useRef<HTMLInputElement>(null);
@@ -223,8 +228,12 @@ function WorkspaceApp() {
       setChatOpen(false);
       setInput("");
       setFileDraft(null);
+      setServiceResult(undefined);
+      setMailPreview(undefined);
       retry.current = undefined;
       voice.current?.stop();
+      recording.current?.cancel();
+      setRecordingStatus("off");
     }
     scope.current = nextScope;
     currentState.current = next;
@@ -278,6 +287,8 @@ function WorkspaceApp() {
       .then((next) => {
         if (active) {
           applyState(next);
+          if (!next.account?.user && !window.location.hash.includes("invite="))
+            setAuthMode("register");
           if (
             next.pending &&
             ["draft", "choose", "speech"].includes(next.pending.type)
@@ -297,6 +308,7 @@ function WorkspaceApp() {
     return () => {
       active = false;
       voice.current?.stop();
+      recording.current?.cancel();
     };
   }, []);
   useEffect(() => {
@@ -430,9 +442,120 @@ function WorkspaceApp() {
     setChatOpen(true);
     (camera ? cameraRef : fileRef).current?.click();
   }
+  async function readDisk(path = "disk:/", offset = 0) {
+    const params = new URLSearchParams({ path, offset: String(offset) });
+    const data = await request<{ total: number; path: string; offset: number; items: { name?: string; type?: string; path?: string; url?: string }[] }>(`/api/yandex/disk?${params}`);
+    return { title: `Яндекс Диск · элементов: ${data.total}`, lines: [], disk: data };
+  }
+  async function browseDisk(path: string, offset = 0) {
+    if (inflight.current) return;
+    inflight.current = true;
+    setBusy(true);
+    setError("");
+    const currentScope = scope.current;
+    try {
+      const data = await readDisk(path, offset);
+      if (scope.current === currentScope) setServiceResult(data);
+    } catch (e) {
+      if (scope.current === currentScope) setError(e instanceof Error ? e.message : "Не удалось открыть папку.");
+    } finally {
+      inflight.current = false;
+      setBusy(false);
+    }
+  }
+  async function attachDiskLink(item: { name?: string; url?: string }) {
+    const event = currentState.current?.events.find((entry) => entry.id === currentState.current?.selected);
+    if (!event || !item.url) return;
+    if ((event.links || []).some((link) => link.url === item.url)) {
+      setError("Эта ссылка уже прикреплена к задаче.");
+      return;
+    }
+    if ((event.links || []).length >= 12) {
+      setError("В карточке уже 12 материалов. Удалите ненужную ссылку.");
+      return;
+    }
+    await action({ action: "update", id: event.id, revision: event.revision, links: [...(event.links || []), { label: (item.name || "Яндекс Диск").slice(0, 100), url: item.url, service: "other" }] });
+  }
+  async function attachMailLink(item: { subject: string; url: string }) {
+    const event = currentState.current?.events.find((entry) => entry.id === currentState.current?.selected);
+    if (!event) return;
+    if ((event.links || []).some((link) => link.url === item.url)) { setError("Это письмо уже прикреплено к задаче."); return; }
+    if ((event.links || []).length >= 12) { setError("В карточке уже 12 материалов. Удалите ненужную ссылку."); return; }
+    await action({ action: "update", id: event.id, revision: event.revision, links: [...(event.links || []), { label: item.subject.slice(0, 100) || "Письмо", url: item.url, service: "yandex_mail" }] });
+  }
+  async function previewMailContent(item: { subject: string; url: string }) {
+    const event = currentState.current?.events.find((entry) => entry.id === currentState.current?.selected);
+    if (!event || inflight.current) return;
+    inflight.current = true;
+    setBusy(true);
+    setError("");
+    setMailPreview(undefined);
+    const currentScope = scope.current;
+    try {
+      const message = await request<{ subject: string; text: string }>(`${item.url}?format=json`);
+      if (scope.current === currentScope) setMailPreview({ eventId: event.id, revision: event.revision, title: event.title, subject: message.subject, text: message.text });
+    } catch (e) {
+      if (scope.current === currentScope) setError(e instanceof Error ? e.message : "Не удалось прочитать письмо.");
+    } finally {
+      inflight.current = false;
+      setBusy(false);
+    }
+  }
+  async function saveMailContent() {
+    if (!mailPreview) return;
+    const event = currentState.current?.events.find((entry) => entry.id === mailPreview.eventId);
+    if (!event || currentState.current?.selected !== event.id || event.revision !== mailPreview.revision) {
+      setError("Выбранная задача изменилась. Выберите письмо заново перед переносом.");
+      return;
+    }
+    const text = mailPreview.text.trim();
+    if (!text) { setError("Выберите непустой текст письма."); return; }
+    const description = event.description ? `${event.description}\n\n${text}` : text;
+    if (description.length > 4000) { setError("Описание задачи ограничено 4000 символами. Сократите переносимый текст."); return; }
+    const next = await perform({ requestId: crypto.randomUUID(), command: { action: "update", id: event.id, revision: event.revision, description } });
+    if (next?.events.find((entry) => entry.id === event.id)?.description === description) setMailPreview(undefined);
+  }
   async function submit(text = input) {
-    if (!text.trim()) return;
+    if (!text.trim() || recordingStatus !== "off") return;
     setChatOpen(true);
+    const service = serviceCommand(text);
+    if (service) {
+      if (service === "unsupported") {
+        setError("Для сервиса доступны команды: @Диск покажи файлы, @Календарь покажи календари, @Почта проверь почту и @Почта покажи письма.");
+        return;
+      }
+      if (inflight.current) return;
+      inflight.current = true;
+      setBusy(true);
+      setError("");
+      setServiceResult(undefined);
+      const currentScope = scope.current;
+      try {
+        let result: NonNullable<typeof serviceResult>;
+        if (service === "disk") {
+          result = await readDisk();
+        } else if (service === "calendar") {
+          const data = await request<{ calendars: { name: string }[] }>("/api/yandex/calendars");
+          result = { title: `Яндекс Календарь · календарей: ${data.calendars.length}`, lines: data.calendars.map((item) => item.name) };
+        } else if (service === "mail-messages") {
+          const data = await request<{ total: number; messages: { subject: string; from: string; date?: string; unseen: boolean; url: string }[] }>("/api/yandex/mail/messages");
+          result = { title: `Яндекс Почта · последние письма (${data.total} во входящих)`, lines: [], mail: data.messages };
+        } else {
+          const data = await request<{ messages: number; unseen: number }>("/api/yandex/mail");
+          result = { title: "Яндекс Почта", lines: [`Входящих: ${data.messages}, непрочитанных: ${data.unseen}.`] };
+        }
+        if (scope.current === currentScope) {
+          setServiceResult(result);
+          setInput((current) => current.trim() === text.trim() ? "" : current);
+        }
+      } catch (e) {
+        if (scope.current === currentScope) setError(e instanceof Error ? e.message : "Не удалось обратиться к сервису.");
+      } finally {
+        inflight.current = false;
+        setBusy(false);
+      }
+      return;
+    }
     return perform(
       retry.current?.text === text.trim() && retry.current.source !== "voice"
         ? retry.current
@@ -464,6 +587,7 @@ function WorkspaceApp() {
     setOpenMobile(false);
   }
   async function toggleVoice() {
+    if (recordingStatus !== "off") return;
     if (voiceStatus !== "off") {
       voice.current?.stop();
       return;
@@ -477,19 +601,61 @@ function WorkspaceApp() {
     }
     voice.current = new VoiceSession(
       setVoiceStatus,
-      async (text) => {
+      async (text, pendingToken) => {
         const next = await perform({
           requestId: crypto.randomUUID(),
           text,
           projectId: currentProjectId,
           source: "voice",
           uncertain: true,
+          pendingToken,
         });
         return next?.messages.at(-1)?.id;
       },
       setVoiceError,
+      microphoneSensitivity,
+      () => currentState.current?.pending?.token,
     );
     await voice.current.start();
+  }
+  async function finishRecording() {
+    const active = recording.current;
+    if (!active) return;
+    setRecordingStatus("processing");
+    try {
+      const text = await active.finish();
+      if (recording.current !== active || !text) return;
+      setInput((current) => [current.trim(), text].filter(Boolean).join(" "));
+    } catch (e) {
+      if (recording.current === active)
+        setVoiceError(e instanceof Error ? e.message : "Не удалось распознать запись.");
+    } finally {
+      if (recording.current === active) {
+        recording.current = undefined;
+        setRecordingStatus("off");
+      }
+    }
+  }
+  async function startRecording() {
+    if (recording.current || voiceStatus !== "off" || busy) return;
+    if (!state?.voiceAvailable) {
+      setVoiceError("Распознавание речи пока не подключено.");
+      return;
+    }
+    setChatOpen(true);
+    setVoiceError("");
+    setRecordingStatus("starting");
+    const active = new VoiceRecording(() => void finishRecording());
+    recording.current = active;
+    try {
+      if (await active.start() && recording.current === active) setRecordingStatus("recording");
+    } catch (e) {
+      if (recording.current === active) {
+        recording.current = undefined;
+        setRecordingStatus("off");
+        setVoiceError(e instanceof DOMException && e.name === "NotAllowedError" ? "Нет доступа к микрофону. Разрешите его в браузере." : e instanceof Error ? e.message : "Не удалось начать запись.");
+      }
+    }
   }
   const [fallbackDay] = useState(() =>
     new Intl.DateTimeFormat("sv-SE", { timeZone: "Europe/Moscow" }).format(
@@ -533,6 +699,9 @@ function WorkspaceApp() {
     const member = members.find((item) => item.id === value);
     const inserted = member
       ? `@${member.name}`
+      : value === "disk" ? "@Диск"
+        : value === "calendar" ? "@Календарь"
+          : value === "mail" ? "@Почта покажи письма"
       : value === "telemost"
         ? "https://telemost.yandex.ru/"
         : "";
@@ -578,7 +747,7 @@ function WorkspaceApp() {
         </SelectTrigger>
         <SelectContent position="popper" side="top">
           <SelectGroup>
-            <SelectLabel>Участники · вставка имени без уведомления</SelectLabel>
+            <SelectLabel>Участники · назначение в задаче без уведомления</SelectLabel>
             {members.length ? (
               members.map((member) => (
                 <SelectItem key={member.id} value={member.id}>
@@ -592,7 +761,10 @@ function WorkspaceApp() {
             )}
           </SelectGroup>
           <SelectGroup>
-            <SelectLabel>Сервисы · вставка ссылки</SelectLabel>
+            <SelectLabel>Сервисы · просмотр</SelectLabel>
+            <SelectItem value="disk">Яндекс Диск — файлы</SelectItem>
+            <SelectItem value="calendar">Яндекс Календарь — календари</SelectItem>
+            <SelectItem value="mail">Яндекс Почта — последние письма</SelectItem>
             <SelectItem value="telemost">
               <Video /> Яндекс Телемост — вставить ссылку
             </SelectItem>
@@ -608,7 +780,12 @@ function WorkspaceApp() {
   }
   function closeChat(open: boolean) {
     setChatOpen(open);
-    if (!open) voice.current?.stop();
+    if (!open) {
+      voice.current?.stop();
+      recording.current?.cancel();
+      recording.current = undefined;
+      setRecordingStatus("off");
+    }
   }
   const errorPanel =
     error && state ? (
@@ -643,7 +820,7 @@ function WorkspaceApp() {
       : undefined;
   return (
     <>
-      <Sidebar collapsible="icon">
+      <Sidebar collapsible="offcanvas">
         <SidebarHeader className="px-4 py-5 group-data-[collapsible=icon]:px-2">
           <div className="flex items-center gap-2">
             <span
@@ -779,7 +956,7 @@ function WorkspaceApp() {
       <SidebarInset className="h-dvh min-w-0 overflow-hidden">
         <header className="flex min-h-16 shrink-0 flex-wrap items-center justify-between gap-2 border-b px-4 py-3 sm:px-6">
           <div className="flex min-w-0 items-center gap-3">
-            {isMobile && (
+            {(isMobile || sidebarState === "collapsed") && (
               <SidebarTrigger
                 aria-label="Открыть меню"
                 aria-expanded={isMobile ? openMobile : false}
@@ -854,8 +1031,7 @@ function WorkspaceApp() {
           <>
             <main
               className={cn(
-                "flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto p-4 sm:p-6",
-                "pb-36 sm:pb-36",
+                "flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto p-4 pb-36 sm:p-6 sm:pb-36",
               )}
             >
               {view === "events" && (
@@ -882,7 +1058,7 @@ function WorkspaceApp() {
                   </Button>
                 </div>
               )}
-              {errorPanel}
+              {!chatOpen && errorPanel}
               {view === "board" ? (
                 <KanbanBoard
                   key={`${state.account?.team.id}:${project}`}
@@ -908,135 +1084,12 @@ function WorkspaceApp() {
                 />
               )}
             </main>
-            <footer className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center px-4 pb-3 sm:px-6">
-              <form
-                className="pointer-events-auto w-full max-w-2xl"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  void submit();
-                }}
-              >
-                <InputGroup className="rounded-3xl bg-background shadow-sm transition-transform duration-200 focus-within:scale-[1.015] motion-reduce:transition-none">
-                  <InputGroupTextarea
-                    ref={boardInputRef}
-                    aria-label="Сообщение ассистенту на доске"
-                    placeholder="Напишите, что нужно сделать…"
-                    value={input}
-                    maxLength={2000}
-                    rows={1}
-                    className="min-h-9 transition-[min-height] duration-200 focus:min-h-16 motion-reduce:transition-none"
-                    onChange={(event) =>
-                      updateInput(
-                        event.target.value,
-                        event.target.selectionStart,
-                        "board",
-                      )
-                    }
-                    onKeyDown={(event) => {
-                      if (
-                        event.key === "Enter" &&
-                        !event.shiftKey &&
-                        !event.nativeEvent.isComposing
-                      ) {
-                        event.preventDefault();
-                        void submit();
-                      }
-                    }}
-                  />
-                  <InputGroupAddon
-                    align="block-end"
-                    className="justify-between"
-                  >
-                    <InputGroupButton
-                      type="button"
-                      aria-label="Прикрепить файл"
-                      onClick={() => pickFile()}
-                      disabled={busy}
-                    >
-                      <Plus />
-                    </InputGroupButton>
-                    {mentionPicker("board")}
-                    <InputGroupButton
-                      type="button"
-                      variant="default"
-                      size="icon-sm"
-                      className="rounded-full"
-                      aria-label={
-                        voiceStatus !== "off"
-                          ? "Остановить голосовой разговор"
-                          : input.trim()
-                            ? "Отправить сообщение"
-                            : "Начать голосовой разговор"
-                      }
-                      disabled={busy && voiceStatus === "off"}
-                      onClick={() => {
-                        if (voiceStatus !== "off") {
-                          void toggleVoice();
-                          return;
-                        }
-                        if (input.trim()) {
-                          void submit();
-                          return;
-                        }
-                        setChatOpen(true);
-                        void toggleVoice();
-                      }}
-                    >
-                      {voiceStatus !== "off" ? (
-                        <Square />
-                      ) : input.trim() ? (
-                        <ArrowUp />
-                      ) : (
-                        <AudioLines />
-                      )}
-                    </InputGroupButton>
-                  </InputGroupAddon>
-                </InputGroup>
-              </form>
-            </footer>
-            <p className="sr-only" role="status">
-              {state.messages.at(-1)?.text}
-            </p>
-          </>
-        )}
-      </SidebarInset>
-      <input
-        ref={fileRef}
-        type="file"
-        className="sr-only"
-        tabIndex={-1}
-        aria-label="Выбрать файл"
-        onChange={(event) => {
-          setFileDraft(event.target.files?.[0] || null);
-          event.target.value = "";
-        }}
-      />
-      <input
-        ref={cameraRef}
-        type="file"
-        accept="image/*"
-        capture="environment"
-        className="sr-only"
-        tabIndex={-1}
-        aria-label="Сделать фотографию"
-        onChange={(event) => {
-          setFileDraft(event.target.files?.[0] || null);
-          event.target.value = "";
-        }}
-      />
-      <Sheet open={chatOpen} onOpenChange={closeChat}>
-        <SheetContent className="data-[side=right]:w-full data-[side=right]:sm:max-w-lg">
-          <SheetHeader>
-            <SheetTitle className="flex items-center gap-2">
-              <AudioLines />
-              CallMe — ваш ассистент
-            </SheetTitle>
-            <SheetDescription>
-              Новые записи:{" "}
-              {currentProjectId ? projectNameLabel : "без проекта"}. Поиск по
-              всему пространству.
-            </SheetDescription>
-          </SheetHeader>
+            {chatOpen && (
+              <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center px-4 pb-3 sm:px-6">
+      <section aria-label="Разговор с ассистентом" className="pointer-events-auto flex h-[min(70dvh,40rem)] max-h-[calc(100dvh-5rem)] w-full max-w-2xl flex-col overflow-hidden rounded-3xl border bg-background shadow-lg">
+          <div className="flex justify-end px-3 pt-2">
+            <Button variant="ghost" size="icon-sm" aria-label="Свернуть чат" onClick={() => closeChat(false)}><ChevronDown /></Button>
+          </div>
           {state && (
             <div className="flex min-h-0 flex-1 flex-col">
               <MessageScrollerProvider autoScroll defaultScrollPosition="end">
@@ -1205,6 +1258,7 @@ function WorkspaceApp() {
                 </MessageScroller>
               </MessageScrollerProvider>
               <div className="mx-auto flex w-full max-w-3xl shrink-0 flex-col gap-3 px-4 pb-4 pt-2 sm:px-4 sm:pb-4">
+                {(state.pending || fileDraft || voiceError || serviceResult || mailPreview || recordingStatus !== "off") && <div className="flex max-h-[min(35dvh,18rem)] flex-col gap-3 overflow-y-auto overscroll-contain">
                 {state.pending &&
                   ["draft", "choose", "speech"].includes(
                     state.pending.type,
@@ -1222,6 +1276,7 @@ function WorkspaceApp() {
                             ? state.pending.text
                             : state.messages.at(-1)?.text}
                         </p>
+                        {state.pending.type === "speech" && voiceStatus !== "off" && <p>Скажите «да, верно» или подтвердите кнопкой.</p>}
                         <div className="mt-2 flex flex-wrap gap-2">
                           {state.pending.type === "speech" && (
                             <Button
@@ -1288,47 +1343,68 @@ function WorkspaceApp() {
                     <AlertDescription>{voiceError}</AlertDescription>
                   </Alert>
                 )}
-                {voiceStatus !== "off" && (
+                {serviceResult && (
                   <Alert>
-                    <AudioLines />
-                    <AlertTitle role="status">
-                      {
-                        {
-                          listening: "Слушаю вас",
-                          processing: "Распознаю речь",
-                          speaking: "Озвучиваю ответ",
-                          off: "",
-                        }[voiceStatus]
-                      }
-                    </AlertTitle>
+                    <Link2 />
+                    <AlertTitle>{serviceResult.title}</AlertTitle>
                     <AlertDescription>
-                      <p>Говорите короткими фразами. Можно перебить ответ.</p>
+                      {serviceResult.disk ? <>
+                        <p>{state?.selected && state.events.find((event) => event.id === state.selected) ? `Выбрана запись: ${state.events.find((event) => event.id === state.selected)?.title}.` : "Выберите карточку задачи, затем прикрепите нужный материал."} Доступ определяется настройками Яндекс Диска.</p>
+                        <div className="max-h-44 overflow-y-auto">
+                        {serviceResult.disk.items.map((item, i) => <div key={`${item.path || item.name || "item"}-${i}`} className="mt-2 flex flex-wrap items-center gap-2">
+                          <span className="min-w-0 flex-1 break-words">{item.type === "dir" ? "Папка" : "Файл"}: {item.name || "Без названия"}</span>
+                          {item.type === "dir" && item.path && <Button size="sm" variant="outline" disabled={busy} onClick={() => void browseDisk(item.path!)}>Открыть</Button>}
+                          {item.url && <Button size="sm" variant="outline" disabled={busy || readOnly || !state?.selected} onClick={() => void attachDiskLink(item)}>Прикрепить</Button>}
+                        </div>)}
+                        </div>
+                        {!serviceResult.disk.items.length && <p>Папка пуста.</p>}
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          {serviceResult.disk.path !== "disk:/" && <Button size="sm" variant="outline" disabled={busy} onClick={() => { const segments = serviceResult.disk!.path.slice(6).split("/").filter(Boolean); segments.pop(); void browseDisk("disk:/" + segments.join("/")); }}>Вверх</Button>}
+                          {serviceResult.disk.offset > 0 && <Button size="sm" variant="outline" disabled={busy} onClick={() => void browseDisk(serviceResult.disk!.path, Math.max(0, serviceResult.disk!.offset - 20))}>Назад</Button>}
+                          {serviceResult.disk.offset + serviceResult.disk.items.length < serviceResult.disk.total && <Button size="sm" variant="outline" disabled={busy} onClick={() => void browseDisk(serviceResult.disk!.path, serviceResult.disk!.offset + 20)}>Ещё</Button>}
+                        </div>
+                      </> : serviceResult.mail ? <>
+                        <p>{state?.selected && state.events.find((event) => event.id === state.selected) ? `Выбрана запись: ${state.events.find((event) => event.id === state.selected)?.title}.` : "Выберите карточку задачи, затем письмо."} Ссылка откроется только владельцу подключённого ящика.</p>
+                        <div className="max-h-44 overflow-y-auto">
+                          {serviceResult.mail.map((message) => <div key={message.url} className="mt-2 flex flex-wrap items-center gap-2">
+                            <span className="min-w-0 flex-1 break-words">{message.unseen ? "Непрочитано · " : ""}{message.from}: {message.subject}{message.date ? ` · ${new Date(message.date).toLocaleDateString("ru-RU")}` : ""}</span>
+                            <Button asChild size="sm" variant="outline"><a href={message.url} target="_blank" rel="noreferrer">Открыть</a></Button>
+                            <Button size="sm" variant="outline" disabled={busy || readOnly || !state?.selected} onClick={() => void attachMailLink(message)}>Прикрепить</Button>
+                            <Button size="sm" variant="outline" disabled={busy || readOnly || !state?.selected} onClick={() => void previewMailContent(message)}>Перенести текст</Button>
+                          </div>)}
+                        </div>
+                        {!serviceResult.mail.length && <p>Входящих писем нет.</p>}
+                      </> : serviceResult.lines.length ? <div className="max-h-44 overflow-y-auto">{serviceResult.lines.map((line, i) => <p key={i} className="break-words">{line}</p>)}</div> : <p>Нет элементов.</p>}
+                      <Button className="mt-2" size="sm" variant="outline" onClick={() => setServiceResult(undefined)}>Закрыть</Button>
+                    </AlertDescription>
+                  </Alert>
+                )}
+                {mailPreview && (
+                  <Alert>
+                    <Mail />
+                    <AlertTitle>Текст письма для задачи «{mailPreview.title}»</AlertTitle>
+                    <AlertDescription>
+                      <p>Письмо: {mailPreview.subject}. Выберите или исправьте нужный текст. После сохранения он будет виден участникам команды в описании задачи.</p>
+                      <Textarea aria-label="Текст письма для переноса" className="mt-2 max-h-40 min-h-24" value={mailPreview.text} onChange={(event) => setMailPreview({ ...mailPreview, text: event.target.value })} />
+                      <div className="mt-2 flex gap-2"><Button size="sm" disabled={busy} onClick={() => void saveMailContent()}>Добавить в описание</Button><Button size="sm" variant="outline" onClick={() => setMailPreview(undefined)}>Отменить</Button></div>
+                    </AlertDescription>
+                  </Alert>
+                )}
+                {recordingStatus !== "off" && (
+                  <Alert>
+                    <Mic />
+                    <AlertTitle role="status">{recordingStatus === "starting" ? "Включаю микрофон" : recordingStatus === "recording" ? "Идёт запись" : "Распознаю запись"}</AlertTitle>
+                    <AlertDescription>
+                      <p>До 20 секунд. Распознанный текст появится в поле ввода — проверьте его перед отправкой.</p>
                       <div className="mt-2 flex gap-2">
-                        {voiceStatus === "speaking" && (
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() => {
-                              voice.current?.interrupt();
-                              setVoiceStatus("listening");
-                            }}
-                          >
-                            <VolumeX data-icon="inline-start" />
-                            Перебить
-                          </Button>
-                        )}
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => voice.current?.stop()}
-                        >
-                          <Square data-icon="inline-start" />
-                          Завершить разговор
-                        </Button>
+                        {recordingStatus === "recording" && <Button size="sm" onClick={() => void finishRecording()}>Завершить запись</Button>}
+                        <Button size="sm" variant="outline" onClick={() => { recording.current?.cancel(); recording.current = undefined; setRecordingStatus("off"); }}>Отменить</Button>
                       </div>
                     </AlertDescription>
                   </Alert>
                 )}
+                </div>}
+                <span className="sr-only" role="status">{voiceStatus === "listening" ? "Слушаю вас" : voiceStatus === "processing" ? "Распознаю речь" : voiceStatus === "speaking" ? "Озвучиваю ответ" : ""}</span>
                 <form
                   onSubmit={(e) => {
                     e.preventDefault();
@@ -1367,10 +1443,7 @@ function WorkspaceApp() {
                             }
                           }}
                         />
-                        <InputGroupAddon
-                          align="block-end"
-                          className="justify-between"
-                        >
+                        <InputGroupAddon align="block-end">
                           <InputGroupButton
                             type="button"
                             aria-label="Прикрепить файл"
@@ -1387,13 +1460,16 @@ function WorkspaceApp() {
                           >
                             <Camera />
                           </InputGroupButton>
+                          <InputGroupButton type="button" aria-label="Записать голосовое сообщение" onClick={() => void startRecording()} disabled={busy || recordingStatus !== "off" || voiceStatus !== "off"}>
+                            <Mic />
+                          </InputGroupButton>
                           {mentionPicker("chat")}
                           <InputGroupButton
                             type="button"
                             variant="default"
                             size="icon-sm"
                             className="ml-auto rounded-full"
-                            disabled={busy && voiceStatus === "off"}
+                            disabled={(busy && voiceStatus === "off") || recordingStatus !== "off"}
                             aria-label={
                               voiceStatus !== "off"
                                 ? "Остановить голосовой разговор"
@@ -1426,20 +1502,130 @@ function WorkspaceApp() {
                     </Field>
                   </FieldGroup>
                 </form>
-                <p className="text-center text-[11px] leading-relaxed text-muted-foreground">
-                  {state.mode === "local"
-                    ? "Локальный режим · ограниченный набор текстовых команд. Голос ещё не подключён."
-                    : "Отвечает на основе ваших записей · время по Москве"}
-                  <br />
-                  Напоминания сохраняются без отправки уведомлений.
-                </p>
               </div>
 
               {errorPanel && <div className="px-4 pb-3">{errorPanel}</div>}
             </div>
           )}
-        </SheetContent>
-      </Sheet>
+      </section>
+              </div>
+            )}
+            {!chatOpen && <footer className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center px-4 pb-3 sm:px-6">
+              <form
+                className="pointer-events-auto w-full max-w-2xl"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void submit();
+                }}
+              >
+                <InputGroup className="rounded-3xl bg-background shadow-sm transition-transform duration-200 focus-within:scale-[1.015] motion-reduce:transition-none">
+                  <InputGroupTextarea
+                    ref={boardInputRef}
+                    aria-label="Сообщение ассистенту на доске"
+                    placeholder="Напишите, что нужно сделать…"
+                    value={input}
+                    maxLength={2000}
+                    rows={1}
+                    className="min-h-9 transition-[min-height] duration-200 focus:min-h-16 motion-reduce:transition-none"
+                    onChange={(event) =>
+                      updateInput(
+                        event.target.value,
+                        event.target.selectionStart,
+                        "board",
+                      )
+                    }
+                    onKeyDown={(event) => {
+                      if (
+                        event.key === "Enter" &&
+                        !event.shiftKey &&
+                        !event.nativeEvent.isComposing
+                      ) {
+                        event.preventDefault();
+                        void submit();
+                      }
+                    }}
+                  />
+                  <InputGroupAddon align="block-end">
+                    <InputGroupButton
+                      type="button"
+                      aria-label="Прикрепить файл"
+                      onClick={() => pickFile()}
+                      disabled={busy}
+                    >
+                      <Plus />
+                    </InputGroupButton>
+                    <InputGroupButton type="button" aria-label="Записать голосовое сообщение" onClick={() => void startRecording()} disabled={busy || recordingStatus !== "off" || voiceStatus !== "off"}>
+                      <Mic />
+                    </InputGroupButton>
+                    {mentionPicker("board")}
+                    <InputGroupButton
+                      type="button"
+                      variant="default"
+                      size="icon-sm"
+                      className="ml-auto rounded-full"
+                      aria-label={
+                        voiceStatus !== "off"
+                          ? "Остановить голосовой разговор"
+                          : input.trim()
+                            ? "Отправить сообщение"
+                            : "Начать голосовой разговор"
+                      }
+                      disabled={busy && voiceStatus === "off"}
+                      onClick={() => {
+                        if (voiceStatus !== "off") {
+                          void toggleVoice();
+                          return;
+                        }
+                        if (input.trim()) {
+                          void submit();
+                          return;
+                        }
+                        setChatOpen(true);
+                        void toggleVoice();
+                      }}
+                    >
+                      {voiceStatus !== "off" ? (
+                        <Square />
+                      ) : input.trim() ? (
+                        <ArrowUp />
+                      ) : (
+                        <AudioLines />
+                      )}
+                    </InputGroupButton>
+                  </InputGroupAddon>
+                </InputGroup>
+              </form>
+            </footer>}
+            <p className="sr-only" role="status">
+              {state.messages.at(-1)?.text}
+            </p>
+          </>
+        )}
+      </SidebarInset>
+      <input
+        ref={fileRef}
+        type="file"
+        className="sr-only"
+        tabIndex={-1}
+        aria-label="Выбрать файл"
+        onChange={(event) => {
+          setFileDraft(event.target.files?.[0] || null);
+          event.target.value = "";
+        }}
+      />
+      <input
+        ref={cameraRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        className="sr-only"
+        tabIndex={-1}
+        aria-label="Сделать фотографию"
+        onChange={(event) => {
+          setFileDraft(event.target.files?.[0] || null);
+          event.target.value = "";
+        }}
+      />
       <Dialog
         open={projectOpen}
         onOpenChange={(open) => {
@@ -1508,6 +1694,8 @@ function WorkspaceApp() {
         open={settings}
         onOpenChange={setSettings}
         voiceAvailable={state?.voiceAvailable || false}
+        microphoneSensitivity={microphoneSensitivity}
+        onMicrophoneSensitivityChange={(value) => { setMicrophoneSensitivity(value); try { localStorage.setItem("callme-microphone-sensitivity", value); } catch { setVoiceError("Настройка микрофона применена только до закрытия страницы."); } }}
         account={state?.account}
         mutate={accountAction}
         busy={busy}

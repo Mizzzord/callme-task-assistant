@@ -26,13 +26,13 @@ after(async () => {
   store.db.close();
   rmSync(temp, { recursive: true });
 });
-function client() {
+function client(baseUrl = base) {
   const cookies = new Map<string, string>();
   let teamId = "";
   return {
     cookies,
     async raw(path: string, body?: unknown, expected = 200) {
-      const response = await fetch(base + path, {
+      const response = await fetch(baseUrl + path, {
         method: body === undefined ? "GET" : "POST",
         headers: {
           cookie: [...cookies].map(([k, v]) => `${k}=${v}`).join("; "),
@@ -110,6 +110,48 @@ test("registration preserves guest records, hashes credentials and isolates acco
     password: "test-only-passphrase",
   });
   assert.equal((await c.state()).events[0].priority, "high");
+});
+test("username registration and login preserve the workspace and reject duplicates", async () => {
+  const isolated = createApp(store, () => now).listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => isolated.once("listening", resolve));
+  const address = isolated.address();
+  assert(address && typeof address !== "string");
+  const url = `http://127.0.0.1:${address.port}`;
+  try {
+  const first = client(url);
+  await first.state();
+  await first.command({ action: "create", title: "Задача нового пользователя" });
+  await first.raw("/api/auth/register", { email: "Тест_Пользователь", name: "Тест_Пользователь", password: "test-only-passphrase" });
+  const registered = await first.state();
+  assert.equal(registered.events[0].title, "Задача нового пользователя");
+  const second = client(url);
+  await second.state();
+  await second.raw("/api/auth/register", { email: "тест_пользователь", name: "другой", password: "test-only-passphrase" }, 409);
+  await first.raw("/api/auth/logout", {});
+  await second.raw("/api/auth/login", { email: "ТЕСТ_ПОЛЬЗОВАТЕЛЬ", password: "test-only-passphrase" });
+  const restored = await second.state();
+  assert.equal(restored.account?.user?.id, registered.account?.user?.id);
+  assert.equal(restored.events[0].title, "Задача нового пользователя");
+  } finally {
+    await new Promise<void>((resolve) => isolated.close(() => resolve()));
+  }
+});
+test("chat mentions assign a team member in text and confirmed speech", async () => {
+  const owner = client();
+  const s = await owner.register("mention-owner");
+  const userId = s.account!.user!.id;
+  const sendText = (text: string, source?: "voice") => owner.raw("/api/chat", { requestId: randomUUID(), text, ...(source ? { source } : {}) }) as Promise<AppState>;
+  const created = await sendText("Создай задачу проверить документы @mention-owner");
+  assert.equal(created.events.at(-1)?.assigneeId, userId);
+  assert.equal(created.events.at(-1)?.title, "проверить документы");
+  const pending = await sendText("Создай задачу подготовить доклад @mention-owner", "voice");
+  assert.equal(pending.pending?.type, "speech");
+  assert.equal(pending.events.length, 1);
+  const confirmed = await owner.command({ action: "confirm", token: pending.pending!.token });
+  assert.equal(confirmed.events.at(-1)?.assigneeId, userId);
+  assert.equal(confirmed.events.at(-1)?.title, "подготовить доклад");
+  const moved = await sendText("Перенеси задачу подготовить доклад в колонку в работе");
+  assert.equal(moved.events.at(-1)?.status, "in_progress");
 });
 test("member and viewer roles, shared assignments, private conversations, stale edits, and revocation", async () => {
   const owner = client(),

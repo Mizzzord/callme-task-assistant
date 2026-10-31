@@ -20,7 +20,7 @@ export type Project = { id: string; name: string };
 export type RelatedLink = {
   label: string;
   url: string;
-  service: "telegram" | "yandex_notes" | "other";
+  service: "telegram" | "yandex_notes" | "yandex_mail" | "other";
 };
 export type EventKind = "task" | "meeting" | "reminder";
 export type CalendarEvent = {
@@ -71,6 +71,7 @@ export type Command = {
     | "select"
     | "confirm"
     | "cancel"
+    | "reply"
     | "unknown";
   title?: string;
   description?: string;
@@ -91,6 +92,7 @@ export type Command = {
   revision?: number;
   token?: string;
   question?: string;
+  answer?: string;
 };
 export type Pending = {
   token: string;

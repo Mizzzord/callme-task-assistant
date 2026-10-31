@@ -35,8 +35,6 @@ export function AuthDialog({
 }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [name, setName] = useState("");
-  const [teamName, setTeamName] = useState("Моя команда");
   const [error, setError] = useState("");
   return (
     <Dialog
@@ -70,7 +68,7 @@ export function AuthDialog({
                 email,
                 password,
                 ...(mode === "register"
-                  ? { name, ...(inviteToken ? { inviteToken } : { teamName }) }
+                  ? { name: email.trim(), ...(inviteToken ? { inviteToken } : {}) }
                   : {}),
               });
               setPassword("");
@@ -82,33 +80,22 @@ export function AuthDialog({
           }}
         >
           <FieldGroup>
-            {mode === "register" && (
-              <Field>
-                <FieldLabel htmlFor="account-name">Ваше имя *</FieldLabel>
-                <Input
-                  id="account-name"
-                  autoComplete="name"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  minLength={2}
-                  maxLength={80}
-                  required
-                />
-              </Field>
-            )}
             <Field>
               <FieldLabel htmlFor="account-email">
-                Электронная почта *
+                {mode === "register" ? "Имя пользователя *" : "Имя пользователя или почта *"}
               </FieldLabel>
               <Input
                 id="account-email"
-                type="email"
+                type="text"
                 autoComplete="username"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 maxLength={254}
                 required
               />
+              {mode === "register" && (
+                <FieldDescription>От 3 до 40 букв или цифр; также можно использовать точку, дефис и подчёркивание.</FieldDescription>
+              )}
             </Field>
             <Field>
               <FieldLabel htmlFor="account-password">Пароль *</FieldLabel>
@@ -125,24 +112,9 @@ export function AuthDialog({
                 required
               />
               <FieldDescription>
-                Не менее 10 символов. Восстановление по почте пока не
-                подключено.
+                Не менее 10 символов. Восстановление пароля пока не подключено.
               </FieldDescription>
             </Field>
-            {mode === "register" && !inviteToken && (
-              <Field>
-                <FieldLabel htmlFor="initial-team">
-                  Название команды *
-                </FieldLabel>
-                <Input
-                  id="initial-team"
-                  value={teamName}
-                  onChange={(e) => setTeamName(e.target.value)}
-                  maxLength={80}
-                  required
-                />
-              </Field>
-            )}
             {error && (
               <Alert variant="destructive">
                 <AlertDescription>{error}</AlertDescription>

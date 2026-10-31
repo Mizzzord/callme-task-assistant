@@ -234,7 +234,7 @@ export function KanbanBoard({
         aria-label="Колонка доски"
       >
         {columns.map((c) => (
-          <ToggleGroupItem className="flex-1" key={c} value={c}>
+          <ToggleGroupItem className="min-w-0 flex-1 text-[11px] sm:text-sm" key={c} value={c}>
             {statusNames[c]} ·{" "}
             {filtered.filter((e) => statusOf(e) === c).length}
           </ToggleGroupItem>
@@ -248,7 +248,7 @@ export function KanbanBoard({
               key={column}
               aria-label={statusNames[column]}
               className={cn(
-                "flex min-h-0 flex-col gap-3 rounded-xl bg-muted/50 p-3",
+                "flex min-h-0 min-w-0 flex-col gap-3 rounded-xl bg-muted/50 p-3",
 
                 mobileColumn !== column && "hidden lg:flex",
                 over === column && "outline-2 outline-ring bg-accent",
@@ -306,7 +306,7 @@ export function KanbanBoard({
               </div>
               <div className={cn("flex min-h-0 flex-1 flex-col gap-3 p-1.5", !composerInset && "overflow-y-auto")}>
                 {!items.length && (
-                  <Empty className="px-3 py-8">
+                  <Empty className="flex-none px-3 py-8">
                     <EmptyHeader>
                       <EmptyTitle>
                         {query ? "Ничего не найдено" : "Пока пусто"}

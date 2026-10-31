@@ -41,6 +41,7 @@ async function client() {
         source?: "voice";
         uncertain?: boolean;
         projectId?: string | null;
+        pendingToken?: string;
         expectStatus?: number;
       } = {},
     ) {
@@ -54,6 +55,7 @@ async function client() {
         body: JSON.stringify({
           requestId: options.requestId || randomUUID(),
           projectId: options.projectId,
+          pendingToken: options.pendingToken,
           ...(typeof content === "string"
             ? { text: content }
             : { command: content }),
@@ -69,6 +71,19 @@ async function client() {
   };
 }
 const last = (s: AppState) => s.messages.at(-1)?.text || "";
+test("voice confirmation acts only on the captured pending request", async () => {
+  const c = await client();
+  await c.state();
+  const pending = await c.chat("Создай задачу полить цветы", { source: "voice", uncertain: true });
+  assert.equal(pending.pending?.type, "speech");
+  const before = pending.events.length;
+  const stale = await c.chat("Да, верно", { source: "voice", uncertain: true, pendingToken: randomUUID(), expectStatus: 503 });
+  assert.match((stale as unknown as { error: string }).error, /устарело/);
+  assert.equal((await c.state()).events.length, before);
+  const confirmed = await c.chat("Да, верно", { source: "voice", uncertain: true, pendingToken: pending.pending!.token });
+  assert.equal(confirmed.events.length, before + 1);
+  assert.equal(confirmed.events.at(-1)?.title, "полить цветы");
+});
 test("1000 source records, exact originals, duplicates kept, repeat import preserves edit and deletion", async () => {
   const c = await client();
   const s = await c.state();

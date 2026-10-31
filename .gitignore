@@ -26,5 +26,6 @@ dist-ssr
 .env.*
 !.env.example
 data/*.sqlite*
+data/.yandex-vault/
 test-results/
 playwright-report/

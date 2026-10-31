@@ -1,6 +1,10 @@
 import express from "express";
 import { Accounts, AccessError, installAccountRoutes } from "./accounts.ts";
 import type { Identity, Locked } from "./accounts.ts";
+import { installYandexRoutes } from "./yandex.ts";
+import type { MailReaders } from "./yandex.ts";
+import { resolveMention } from "./mentions.ts";
+import { splitSpeechText } from "./tts.ts";
 import cookieParser from "cookie-parser";
 import { randomBytes, createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -14,7 +18,7 @@ import {
   understand,
 } from "./providers.ts";
 import type { Workspace, Command } from "../src/types.ts";
-export function createApp(store: Store, clock = () => new Date()) {
+export function createApp(store: Store, clock = () => new Date(), mailReaders?: MailReaders) {
   const app = express();
   app.disable("x-powered-by");
   app.use(cookieParser());
@@ -50,6 +54,7 @@ export function createApp(store: Store, clock = () => new Date()) {
     next();
   });
   installAccountRoutes(app, accounts, locked, clock);
+  installYandexRoutes(app, accounts, mailReaders);
   app.use("/api", (req, res, next) => {
     res.set("Cache-Control", "no-store");
     res.set("X-Content-Type-Options", "nosniff");
@@ -207,6 +212,7 @@ export function createApp(store: Store, clock = () => new Date()) {
       command: commandSchema.optional(),
       source: z.enum(["text", "voice"]).default("text"),
       uncertain: z.boolean().default(false),
+      pendingToken: z.string().uuid().optional(),
     })
     .refine(
       (b) => Boolean(b.text) !== Boolean(b.command),
@@ -242,13 +248,20 @@ export function createApp(store: Store, clock = () => new Date()) {
         )
           throw new Error("Проект не найден в вашем пространстве.");
         let cmd: Command;
+        let mention = body.text ? resolveMention(body.text, accounts.members(id)) : undefined;
         const local = body.text
-          ? localCommand(body.text, ws, clock())
+          ? localCommand(mention!.text, ws, clock())
           : undefined;
+        const spokenConfirmation = body.source === "voice" && local?.action === "confirm";
+        if (spokenConfirmation && (ws.pending || body.pendingToken) && (!ws.pending || !body.pendingToken || body.pendingToken !== ws.pending.token || !["speech", "delete", "past", "conflict"].includes(ws.pending.type)))
+          throw new Error("Голосовое подтверждение устарело. Проверьте действие и подтвердите его ещё раз.");
+        const spoken = body.source === "voice" && body.text && gptEnabled() && local?.action === "unknown"
+          ? await understand(store, mention!.text, ws, clock())
+          : local;
         if (
           body.source === "voice" &&
-          (!local ||
-            !["select", "cancel", "list", "search"].includes(local.action))
+          (!spoken ||
+            !["select", "cancel", "list", "search", "reply", "unknown", ...(spokenConfirmation ? ["confirm"] : [])].includes(spoken.action))
         ) {
           if (identity?.role === "viewer")
             throw new AccessError(
@@ -273,42 +286,48 @@ export function createApp(store: Store, clock = () => new Date()) {
               id: randomUUID(),
               role: "assistant",
               text:
-                "Распознано без оценки уверенности. Проверьте текст перед действием: «" +
-                body.text +
-                "».",
+                "Я услышал: «" + body.text + "». Всё верно? Скажите «да, верно» или подтвердите кнопкой.",
               at: clock().toISOString(),
             },
           );
         } else {
           if (body.command) cmd = body.command;
+          else if (body.source === "voice" && spoken) cmd = spokenConfirmation ? { ...spoken, token: body.pendingToken } : spoken;
           else if (
             local &&
-            (["confirm", "cancel", "select"].includes(local.action) ||
+            (["confirm", "cancel", "select", "move"].includes(local.action) ||
               (body.source === "voice" &&
                 ["list", "search"].includes(local.action)))
           )
             cmd = local;
           else
             cmd = gptEnabled()
-              ? await understand(store, body.text!, ws, clock())
+              ? await understand(store, mention!.text, ws, clock())
               : local!;
           if (
             cmd.action === "confirm" &&
-            ws.pending?.type === "speech" &&
-            gptEnabled()
+            ws.pending?.type === "speech"
           ) {
             if (cmd.token && cmd.token !== ws.pending.token)
               throw new Error("Подтверждение устарело.");
             const text = ws.pending.text!;
             const projectId = ws.pending.projectId;
             ws.pending = ws.pending.prior;
-            cmd = await understand(store, text, ws, clock());
+            mention = resolveMention(text, accounts.members(id));
+            const recognized = localCommand(mention.text, ws, clock());
+            cmd = gptEnabled() && recognized.action !== "move"
+              ? await understand(store, mention.text, ws, clock())
+              : recognized;
+            if (cmd.action === "unknown" && cmd.question === "Не удалось точно понять запрос. Уточните, что нужно сделать; записи не изменены." && recognized.action === "create" && recognized.title)
+              cmd = recognized;
             if (cmd.action === "create") cmd.projectId = projectId;
           }
+          if (mention?.assigneeId && ["create", "update"].includes(cmd.action))
+            cmd.assigneeId = mention.assigneeId;
           if (cmd.action === "create" && cmd.projectId === undefined)
             cmd.projectId = body.projectId;
           const current = accounts.current(identity);
-          const readActions = ["list", "search", "select", "cancel", "unknown"];
+          const readActions = ["list", "search", "select", "cancel", "reply", "unknown"];
           if (
             current?.role === "viewer" &&
             (!readActions.includes(cmd.action) ||
@@ -417,24 +436,24 @@ export function createApp(store: Store, clock = () => new Date()) {
         },
       );
       const data = await response.json();
-      if (!data.result)
-        throw new Error(
-          "Речь не распознана. Повторите фразу или введите текст.",
-        );
-      res.json({ text: data.result, uncertain: true });
+      if (typeof data.result !== "string")
+        throw new Error("Сервис распознавания вернул некорректный ответ.");
+      res.json({ text: data.result.trim(), uncertain: true });
     } catch (e) {
       next(e);
     }
   });
   app.post("/api/voice/synthesize", async (req, res, next) => {
     try {
-      const { messageId } = z
-        .object({ messageId: z.string().uuid() })
+      const { messageId, part } = z
+        .object({ messageId: z.string().uuid(), part: z.number().int().min(0).max(99).default(0) })
         .parse(req.body);
       const msg = store
         .readFor(res.locals.owner, res.locals.account?.user.id)
         .messages.find((m) => m.id === messageId && m.role === "assistant");
       if (!msg) throw new Error("Ответ для озвучивания не найден.");
+      const parts = splitSpeechText(msg.text);
+      if (!parts[part]) throw new Error("Часть ответа для озвучивания не найдена.");
       const response = await providerFetch(
         store,
         "tts",
@@ -443,14 +462,14 @@ export function createApp(store: Store, clock = () => new Date()) {
           method: "POST",
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
           body: new URLSearchParams({
-            text: msg.text.slice(0, 1000),
+            text: parts[part],
             lang: "ru-RU",
             voice: process.env.YANDEX_VOICE || "alena",
             format: "mp3",
           }),
         },
       );
-      res.type("audio/mpeg").send(Buffer.from(await response.arrayBuffer()));
+      res.set("X-TTS-Parts", String(parts.length)).type("audio/mpeg").send(Buffer.from(await response.arrayBuffer()));
     } catch (e) {
       next(e);
     }
@@ -494,6 +513,7 @@ function actionLabel(c: Command) {
     select: "Выбрать запись",
     confirm: "Подтверждаю",
     cancel: "Отмена",
+    reply: "Ответ",
     list: "Показать записи",
     search: "Поиск",
     unknown: "Уточнение",

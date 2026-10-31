@@ -59,8 +59,8 @@ export function TaskCard({
         }
       }}
     >
-      <CardHeader className="gap-3">
-        <CardDescription className="min-w-0 break-words">
+      <CardHeader className="min-w-0 gap-3 has-data-[slot=card-action]:grid-cols-[minmax(0,1fr)_auto]">
+        <CardDescription className="min-w-0 [overflow-wrap:anywhere]">
           {project}
         </CardDescription>
         {draggable && (
@@ -71,8 +71,8 @@ export function TaskCard({
             />
           </CardAction>
         )}
-        <CardTitle className="break-words">{title}</CardTitle>
-        <CardDescription className="line-clamp-4 whitespace-pre-wrap break-words">
+        <CardTitle className="min-w-0 [overflow-wrap:anywhere]">{title}</CardTitle>
+        <CardDescription className="min-w-0 whitespace-pre-wrap [overflow-wrap:anywhere]">
           {description || "Без описания"}
         </CardDescription>
       </CardHeader>
@@ -110,7 +110,7 @@ export function TaskCard({
                   {initials || <UserRound className="size-3" />}
                 </AvatarFallback>
               </Avatar>
-              <span className="break-words text-sm">
+              <span className="min-w-0 [overflow-wrap:anywhere] text-sm">
                 {assignee || "Не назначен"}
               </span>
             </dd>
